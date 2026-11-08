@@ -5,6 +5,7 @@ using Devolutions.Pinget.Core;
 using UniGetUI.Core.Data;
 using UniGetUI.Core.SettingsEngine;
 using UniGetUI.Core.Tools;
+using UniGetUI.PackageEngine.AgentBroker;
 using UniGetUI.PackageEngine.Classes.Manager;
 using UniGetUI.PackageEngine.Enums;
 using UniGetUI.PackageEngine.Interfaces;
@@ -3759,6 +3760,133 @@ public sealed class WinGetManagerTests : IDisposable
         }
 
         Assert.Null(package.OverridenOptions.RunAsAdministrator);
+    }
+
+    // 0x8A15007D: WinGet refuses, from a full administrator token, to uninstall or repair a
+    // package installed in the user scope, and an update with UpgradeBehavior uninstallPrevious
+    // goes through that uninstall (microsoft/winget-cli#6345).
+    private const uint AdminContextActionProhibited = 0x8A15007D;
+
+    [Theory]
+    [InlineData(OperationType.Update)]
+    [InlineData(OperationType.Install)]
+    public void WinGetRetriesUnelevatedWhenWinGetRefusesTheElevationUniGetUIForcedOnAUserScopePackage(
+        OperationType operation
+    )
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.SystemWinGet);
+        var package = CreatePortablePackage(manager);
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () =>
+            {
+                manager.OperationHelper.GetParameters(package, new InstallOptions(), operation);
+                Assert.True(package.OverridenOptions.RunAsAdministrator);
+
+                var veredict = manager.OperationHelper.GetResult(
+                    package,
+                    operation,
+                    ["The package installed for user scope cannot be uninstalled when running with administrator privileges."],
+                    unchecked((int)AdminContextActionProhibited)
+                );
+
+                OperationAssert.HasVeredict(veredict, OperationVeredict.AutoRetry);
+                Assert.False(package.OverridenOptions.RunAsAdministrator);
+
+                manager.OperationHelper.GetParameters(package, new InstallOptions(), operation);
+                Assert.False(package.OverridenOptions.RunAsAdministrator);
+                Assert.False(BrokerRequestValidator.RequestsElevation(package, new InstallOptions()));
+            }
+        );
+    }
+
+    [Fact]
+    public void WinGetRetriesUnelevatedOnlyOnceWhenWinGetKeepsRefusingTheElevation()
+    {
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.SystemWinGet);
+        var package = CreatePortablePackage(manager);
+        package.OverridenOptions.RunAsAdministrator = true;
+
+        WithPortableLinkSeams(
+            canElevate: true,
+            canCreateSymlinks: false,
+            () =>
+            {
+                var first = manager.OperationHelper.GetResult(
+                    package,
+                    OperationType.Update,
+                    [],
+                    unchecked((int)AdminContextActionProhibited)
+                );
+                var second = manager.OperationHelper.GetResult(
+                    package,
+                    OperationType.Update,
+                    [],
+                    unchecked((int)AdminContextActionProhibited)
+                );
+
+                OperationAssert.HasVeredict(first, OperationVeredict.AutoRetry);
+                OperationAssert.HasVeredict(second, OperationVeredict.Failure);
+            }
+        );
+    }
+
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData(true, false)]
+    [InlineData(null, true)]
+    public void WinGetDoesNotRetryUnelevatedWhenDroppingTheForcedElevationCannotHelp(
+        bool? forcedElevation,
+        bool processCanElevateAsTheSameAccount
+    )
+    {
+        // Nothing to drop when UniGetUI forced nothing (the user asked for administrator rights,
+        // which this result cannot undo), and an already elevated process, or a standard user
+        // elevating as another account, does not get a limited token back by dropping it.
+        var manager = new WinGet();
+        SetCliToolKind(manager, WinGetCliToolKind.SystemWinGet);
+        var package = CreatePortablePackage(manager);
+        package.OverridenOptions.RunAsAdministrator = forcedElevation;
+
+        WithPortableLinkSeams(
+            canElevate: processCanElevateAsTheSameAccount,
+            canCreateSymlinks: false,
+            () =>
+            {
+                var veredict = manager.OperationHelper.GetResult(
+                    package,
+                    OperationType.Update,
+                    [],
+                    unchecked((int)AdminContextActionProhibited)
+                );
+
+                OperationAssert.HasVeredict(veredict, OperationVeredict.Failure);
+            }
+        );
+        Assert.Equal(forcedElevation, package.OverridenOptions.RunAsAdministrator);
+    }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void WinGetInstallerMetadataDoesNotReElevateAPackageThatMustRunUnelevated(
+        bool? earlierDecision,
+        bool expected
+    )
+    {
+        // Without this, an installer whose metadata asks for elevation would be elevated again
+        // on the retry that dropped it, fail the same way, and retry forever.
+        var package = CreatePortablePackage(new WinGet());
+        package.OverridenOptions.RunAsAdministrator = earlierDecision;
+
+        WinGetPkgOperationHelper.ForceInstallerElevation(package, "requires elevation");
+
+        Assert.Equal(expected, package.OverridenOptions.RunAsAdministrator);
     }
 
     [Fact]

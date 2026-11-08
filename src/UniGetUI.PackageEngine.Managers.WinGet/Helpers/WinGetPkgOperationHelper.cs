@@ -356,10 +356,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                     or ElevationRequirement.ElevatesSelf
             )
             {
-                Logger.Info(
-                    $"WinGet package {package.Id} requires elevation, forcing administrator rights..."
-                );
-                package.OverridenOptions.RunAsAdministrator = true;
+                ForceInstallerElevation(package, "requires elevation");
             }
             else if (
                 installOptions?.ElevationRequirement is ElevationRequirement.ElevationProhibited
@@ -393,10 +390,7 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
                 installOptions?.Scope is PackageInstallerScope.System /* or PackageInstallerScope.Unknown*/
             )
             {
-                Logger.Info(
-                    $"WinGet package {package.Id} is installed on a system-wide scope, forcing administrator rights..."
-                );
-                package.OverridenOptions.RunAsAdministrator = true;
+                ForceInstallerElevation(package, "is installed on a system-wide scope");
             }
         }
         catch (Exception ex)
@@ -407,6 +401,22 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             Logger.Error("Recovered from fatal WinGet exception:");
             Logger.Error(ex);
         }
+    }
+
+    internal static void ForceInstallerElevation(IPackage package, string reason)
+    {
+        // Elevation dropped after WinGet refused it (0x8A150056, 0x8A15007D) must stay dropped:
+        // forcing it again would fail the same way, and AutoRetry has no attempt limit.
+        if (package.OverridenOptions.RunAsAdministrator is false)
+        {
+            Logger.Info(
+                $"WinGet package {package.Id} {reason}, but an earlier attempt showed it cannot run elevated; keeping it unelevated"
+            );
+            return;
+        }
+
+        Logger.Info($"WinGet package {package.Id} {reason}, forcing administrator rights...");
+        package.OverridenOptions.RunAsAdministrator = true;
     }
 
     protected override OperationVeredict _getOperationResult(
@@ -509,6 +519,23 @@ internal sealed class WinGetPkgOperationHelper : BasePkgOperationHelper
             && !CoreTools.IsAdministrator()
         )
         { // Installer can't run elevated, but this condition hasn't been forced on UniGetUI
+            package.OverridenOptions.RunAsAdministrator = false;
+            return OperationVeredict.AutoRetry;
+        }
+
+        if (
+            uintCode is 0x8A15007D
+            && package.OverridenOptions.RunAsAdministrator is true
+            && CanElevateAsCurrentAccount()
+        )
+        { // WinGet refuses, from a full administrator token, to uninstall or repair a package
+          // installed in the user scope, and an update with UpgradeBehavior uninstallPrevious goes
+          // through that uninstall (microsoft/winget-cli#6345). Drop the elevation UniGetUI forced
+          // (for example to keep portable links); elevation the user asked for is kept.
+            Logger.Warn(
+                $"WinGet refused to run the {operation} of {package.Id} elevated because the package "
+                    + "is installed in the user scope; retrying without administrator rights"
+            );
             package.OverridenOptions.RunAsAdministrator = false;
             return OperationVeredict.AutoRetry;
         }
